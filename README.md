@@ -14,6 +14,8 @@ Now I need markdown in my terminal because I need to read and curate all the slo
     treesitter syntax highlighting (lua, python, js/ts, rust, go, bash, ...)
   - Blockquotes with a `▏` prefix
   - Tables with aligned columns
+  - Mermaid flowcharts (```mermaid) drawn as Unicode boxes and arrows, with no
+    external tools
   - Horizontal rules
   - Inline **bold**, *italic*, `code`, [links](url), ![images](url)
 - **Editing** (insert / replace / visual): raw markdown source
@@ -69,6 +71,9 @@ also shows the raw source. `:MarkdownConsoleToggle` flips the view manually.
 - The plugin turns Neovim's native markdown highlighter off for the buffers it
   manages, because it draws its own highlights and full-line conceal over the raw
   text.
+- Mermaid support covers `graph` / `flowchart` diagrams (TD/TB/BT/LR/RL). It is a
+  best-effort layout: unrecognised directives are ignored and an unrenderable
+  diagram is left as raw source.
 
 ## How It Works
 

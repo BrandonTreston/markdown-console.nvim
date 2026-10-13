@@ -23,6 +23,11 @@
 
 local M = {}
 
+-- Pure-Lua mermaid renderer, optional: if it fails to load, mermaid blocks
+-- simply stay as raw source.
+local mermaid = select(2, pcall(require, 'markdown-console.mermaid'))
+local mermaid_dirs = { mermaid = true, mmd = true }
+
 local ns = vim.api.nvim_create_namespace('markdown_console')
 
 -- bufnr -> true while the rendered overlay is shown
@@ -231,7 +236,9 @@ local function parse(lines)
         body[#body + 1] = lines[i]
         next_()
       end
-      blocks[#blocks + 1] = { kind = 'code', lang = lang, lines = body, n = #body + 2 }
+      local llang = lang:lower()
+      local kind = mermaid_dirs[llang] and 'mermaid' or 'code'
+      blocks[#blocks + 1] = { kind = kind, lang = lang, lines = body, n = #body + 2 }
     elseif line:match('^%s*>') then
       local quote = {}
       while i <= #lines and lines[i]:match('^%s*>') do
@@ -333,6 +340,11 @@ local function build_rows(lines, bar)
         for _, s in ipairs(plain(q, 'MarkdownConsoleQuote')) do cs[#cs + 1] = s end
         put(cs)
       end
+
+    elseif b.kind == 'mermaid' then
+      -- The diagram is not built here: it needs the buffer rows to overlay onto.
+      -- Emit one placeholder per source line so later rows stay aligned.
+      for _ = 1, b.n do put({}) end
 
     elseif b.kind == 'code' then
       local widest = 0
@@ -491,6 +503,19 @@ local function overlay_row(buf, row, line, row_data)
   })
 end
 
+-- Overlay one styled run on a row, hiding the row's own text. Used for rendered
+-- blocks whose shape differs from the source (mermaid diagrams).
+local function overlay_text(buf, row, line_len, text, group)
+  pcall(vim.api.nvim_buf_set_extmark, buf, ns, row, 0, {
+    end_col = line_len,
+    conceal = '',
+    virt_text = { { text, group } },
+    virt_text_pos = 'overlay',
+    hl_mode = 'replace',
+    priority = 100,
+  })
+end
+
 local function render(buf, force)
   if busy or not md(buf) or not shown(buf) then return end
   if rendered[buf] and not force then
@@ -517,7 +542,31 @@ local function render(buf, force)
     end
     local li = 0
     for _, b in ipairs(parse(lines)) do
-      if b.kind == 'code' or b.kind == 'table' then
+      if b.kind == 'mermaid' then
+        local art = mermaid and mermaid.render(table.concat(b.lines, '\n')) or nil
+        if art and #art > 0 then
+          local last = li + b.n
+          for k = 1, b.n do
+            local ln = lines[li + k]
+            if ln then conceal(buf, li + k - 1, 0, #ln) end
+          end
+          local below = {}
+          for k = 1, #art do
+            local target = li + k
+            if target <= last then
+              overlay_text(buf, target - 1, #(lines[target] or ''), art[k], 'MarkdownConsoleMermaid')
+            else
+              below[#below + 1] = { { art[k], 'MarkdownConsoleMermaid' } }
+            end
+          end
+          if #below > 0 then
+            pcall(vim.api.nvim_buf_set_extmark, buf, ns, last - 1, 0, { virt_lines = below })
+          end
+          li = last
+        else
+          li = li + b.n
+        end
+      elseif b.kind == 'code' or b.kind == 'table' then
         for _ = 1, b.n do
           li = li + 1
           if li > #lines then break end
@@ -640,6 +689,7 @@ local function setup_highlights()
     MarkdownConsoleTableHeader = { bold = true },
     MarkdownConsoleTableRow = {},
     MarkdownConsoleTableSep = { fg = '#6c6c6c' },
+    MarkdownConsoleMermaid = { fg = '#8be9fd' },
   })
 end
 
