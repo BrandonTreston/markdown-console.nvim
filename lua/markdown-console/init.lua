@@ -156,6 +156,25 @@ local function code_marks(body, lang)
 end
 
 -- Turn a code line plus its treesitter ranges into highlight chunks.
+-- Treesitter capture groups carry no background, which would leave gaps in the
+-- code block's background, so each is wrapped in a MarkdownConsole group that
+-- copies its colours and adds the block background.
+local ts_hl_cache = {}
+local function code_token_hl(group)
+  local cached = ts_hl_cache[group]
+  if cached then return cached end
+  local name = 'MarkdownConsoleTs_' .. group:gsub('[@%.]', '_')
+  local ok, hl = pcall(vim.api.nvim_get_hl, 0, { name = group, link = false })
+  if not ok or type(hl) ~= 'table' then hl = {} end
+  hl.bg = '#2d2d2d'
+  hl.link = nil
+  hl.default = nil
+  if not hl.fg then hl.fg = '#c8a060' end
+  pcall(vim.api.nvim_set_hl, 0, name, hl)
+  ts_hl_cache[group] = name
+  return name
+end
+
 local function code_chunks(line, marks)
   local cs = {}
   if not marks or #marks == 0 then
@@ -166,6 +185,7 @@ local function code_chunks(line, marks)
   local pos = 0
   for _, m in ipairs(marks) do
     local s, e, g = m[1], m[2], m[3]
+    if g:sub(1, 1) == '@' then g = code_token_hl(g) end
     if s >= pos then
       if s > pos then cs[#cs + 1] = { line:sub(pos + 1, s), 'MarkdownConsoleCode' } end
       if e > s then cs[#cs + 1] = { line:sub(s + 1, e), g } end
@@ -467,9 +487,9 @@ local function setup_highlights()
     MarkdownConsoleHPrefix = { fg = '#888888', bold = true },
     MarkdownConsoleH1Prefix = { fg = '#ffb3b3', bold = true, bg = '#59202a' },
     MarkdownConsoleList = { fg = '#ffd93d' },
-    MarkdownConsoleCode = { fg = '#c8a060' },
-    MarkdownConsoleFence = { fg = '#6c6c6c' },
-    MarkdownConsoleCodeLang = { fg = '#ffd93d', bold = true, italic = true },
+    MarkdownConsoleCode = { fg = '#c8a060', bg = '#2d2d2d' },
+    MarkdownConsoleFence = { fg = '#6c6c6c', bg = '#2d2d2d' },
+    MarkdownConsoleCodeLang = { fg = '#ffd93d', bold = true, italic = true, bg = '#2d2d2d' },
     MarkdownConsoleQuote = { fg = '#6c6c6c', italic = true },
     MarkdownConsoleHr = { fg = '#6c6c6c' },
     MarkdownConsoleBold = { bold = true },
