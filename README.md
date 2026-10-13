@@ -1,8 +1,8 @@
 # markdown-console.nvim
 
-Shows a rendered view of a markdown buffer in normal mode and the raw source
-while you are editing. The buffer always holds the source; the rendered form is
-drawn over it as a virtual overlay, so nothing is ever written to the buffer.
+I learned Neovim a bit over a year ago. Then AI got good (enough).
+
+Now I need markdown in my terminal because I need to read and curate all the slop. So I made AI make me this slop plugin to read and edit markdown in neovim. Then I proceeded to __not__ read and edit it. Enjoy.
 
 ## Features
 
