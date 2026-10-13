@@ -1,0 +1,105 @@
+*markdown-console.txt*  Rendered markdown view for Neovim   *markdown-console*
+
+==============================================================================
+CONTENTS                                              *markdown-console-contents*
+
+  1. Introduction ............................ |markdown-console-intro|
+  2. Setup ................................... |markdown-console-setup|
+  3. Usage ................................... |markdown-console-usage|
+  4. Commands ................................ |markdown-console-commands|
+  5. Highlight groups ........................ |markdown-console-highlights|
+  6. How it works ............................ |markdown-console-how|
+  7. License ................................. |markdown-console-license|
+
+==============================================================================
+1. INTRODUCTION                                    *markdown-console-intro*
+
+markdown-console shows a rendered view of a markdown buffer in normal mode
+and the raw source while you are editing. The buffer always holds the source;
+only the view is swapped in and out.
+
+  - Normal mode: rendered markdown with highlight groups. Headings (level 1
+    has a full-width background bar, level 2 is underlined, levels 3-6 are
+    bold), bullet and numbered lists, fenced code blocks with box-drawing
+    borders and optional treesitter syntax highlighting, blockquotes, tables,
+    horizontal rules, and inline styling.
+  - Editing (insert, replace, visual): raw markdown source.
+  - Viewing a file never marks the buffer modified and never becomes an undo
+    step. Saving always writes the raw source.
+
+==============================================================================
+2. SETUP                                             *markdown-console-setup*
+
+                                          *markdown-console.setup()*
+    require('markdown-console').setup()
+
+Calling setup() is optional because the plugin sets itself up on load, but it
+is safe to call (it is idempotent).
+
+lazy.nvim: >lua
+    {
+      'BrandonTreston/markdown-console.nvim',
+      ft = 'markdown',
+      config = function()
+        require('markdown-console').setup()
+      end,
+    }
+<
+
+==============================================================================
+3. USAGE                                             *markdown-console-usage*
+
+Open a `.md` file: it renders. Press |i| (or `a`, `o`, `cc`, `s`, `R`, ...) to
+get the raw source back, edit, and press <Esc> to render again. Visual mode
+also shows the raw source.
+
+Switching is driven by the |ModeChanged| event, so every way into and out of
+an editing mode is covered.
+
+==============================================================================
+4. COMMANDS                                          *markdown-console-commands*
+
+:MarkdownConsoleToggle                              *:MarkdownConsoleToggle*
+    Switch the current markdown buffer between the rendered view and the raw
+    source by hand.
+
+==============================================================================
+5. HIGHLIGHT GROUPS                                  *markdown-console-highlights*
+
+Highlight groups are defined with `default = true`, so a colorscheme or your
+config can override any of them.
+
+    MarkdownConsoleH1 .. MarkdownConsoleH6   heading levels
+    MarkdownConsoleHPrefix                   "#" prefix of headings
+    MarkdownConsoleH1Prefix                  "#" prefix of level-1 headings
+    MarkdownConsoleBullet                    list markers
+    MarkdownConsoleQuote                     blockquote prefix
+    MarkdownConsoleQuoteText                 blockquote text
+    MarkdownConsoleRule                      horizontal rule
+    MarkdownConsoleCode                      code block text
+    MarkdownConsoleCodeBorder                code block border
+    MarkdownConsoleCodeLang                  code block language label
+    MarkdownConsoleTableBorder               table separators
+    MarkdownConsoleTableHeader               table header row
+    MarkdownConsoleBold                      **bold**
+    MarkdownConsoleItalic                    *italic*
+    MarkdownConsoleCodeInline                `inline code`
+    MarkdownConsoleLink                      [links](url)
+
+==============================================================================
+6. HOW IT WORKS                                      *markdown-console-how*
+
+  1. When a markdown buffer is shown in normal mode it is parsed and the
+     rendered lines are written into the buffer, with highlights applied as
+     extmarks.
+  2. Entering an editing mode restores the saved source lines; leaving it
+     renders again.
+  3. Saving goes through |BufWriteCmd|, which writes the saved source lines to
+     disk without touching the buffer.
+
+==============================================================================
+7. LICENSE                                           *markdown-console-license*
+
+MIT
+
+vim:tw=78:ts=8:ft=help:norl:
