@@ -3,11 +3,19 @@
 -- Shows a rendered view of a markdown buffer while you are in normal mode and
 -- the raw source while you are editing (insert / replace / visual).
 --
--- The buffer text is NEVER changed. The rendered view is drawn as a per-line
--- overlay (virt_text_pos = "overlay"): for each source line an extmark draws the
--- rendered form on top of the raw text and, where the rendered form is shorter,
--- pads it so the raw text underneath is fully hidden. Entering an editing mode
--- simply clears the overlay, so the raw source reappears.
+-- The buffer text is NEVER changed. The rendered view is drawn with extmarks:
+--
+--   * Lines that fit the window conceal the markdown syntax and keep the text
+--     itself real, so the cursor moves naturally over the rendered line.
+--   * Lines wider than the window, and structural blocks (code boxes, tables)
+--     whose rendered shape differs from the source, fall back to a whole-line
+--     overlay (virt_text_pos = "overlay"): the raw text is concealed and the
+--     rendered form is drawn on top.
+--
+-- Conceal hides the syntax but does not shrink the width Neovim wraps at, so
+-- confining the conceal path to lines that fit is what keeps long lines from
+-- wrapping into a stray fragment. Entering an editing mode clears everything,
+-- so the raw source reappears.
 --
 -- Because the buffer is left alone, Neovim's own undo/redo works for every edit
 -- (insert and normal alike), the buffer only becomes 'modified' when you
@@ -212,9 +220,9 @@ local function parse(lines)
     local next_ = function() i = i + 1 end
 
     if line:match('^%s*$') then
-      blocks[#blocks + 1] = { kind = 'blank' }
+      blocks[#blocks + 1] = { kind = 'blank', n = 1 }
     elseif hashes and #hashes <= 6 then
-      blocks[#blocks + 1] = { kind = 'heading', level = #hashes, segs = inline(line:sub(#hashes + 2)) }
+      blocks[#blocks + 1] = { kind = 'heading', level = #hashes, segs = inline(line:sub(#hashes + 2)), n = 1 }
     elseif line:match('^```') then
       local lang = vim.trim(line:sub(4))
       local body = {}
@@ -223,7 +231,7 @@ local function parse(lines)
         body[#body + 1] = lines[i]
         next_()
       end
-      blocks[#blocks + 1] = { kind = 'code', lang = lang, lines = body }
+      blocks[#blocks + 1] = { kind = 'code', lang = lang, lines = body, n = #body + 2 }
     elseif line:match('^%s*>') then
       local quote = {}
       while i <= #lines and lines[i]:match('^%s*>') do
@@ -231,13 +239,13 @@ local function parse(lines)
         next_()
       end
       i = i - 1
-      blocks[#blocks + 1] = { kind = 'quote', lines = quote }
+      blocks[#blocks + 1] = { kind = 'quote', lines = quote, n = #quote }
     elseif line:match('^%s*[%-%*_]%s*[%-%*_]%s*[%-%*_%s]*$') and #line >= 3 then
-      blocks[#blocks + 1] = { kind = 'hr' }
+      blocks[#blocks + 1] = { kind = 'hr', n = 1 }
     elseif line:match('^%s*[%-%*+]%s+') then
-      blocks[#blocks + 1] = { kind = 'list', marker = '-', segs = inline((line:gsub('^%s*[%-%*+]%s+', ''))) }
+      blocks[#blocks + 1] = { kind = 'list', marker = '-', segs = inline((line:gsub('^%s*[%-%*+]%s+', ''))), n = 1 }
     elseif line:match('^%s*%d+%.%s+') then
-      blocks[#blocks + 1] = { kind = 'list', marker = line:match('^%s*(%d+)'), segs = inline((line:gsub('^%s*%d+%.%s+', ''))) }
+      blocks[#blocks + 1] = { kind = 'list', marker = line:match('^%s*(%d+)'), segs = inline((line:gsub('^%s*%d+%.%s+', ''))), n = 1 }
     elseif line:match('^|.*|%s*$') then
       local rows = {}
       while i <= #lines and lines[i]:match('^|.*|%s*$') do
@@ -252,9 +260,9 @@ local function parse(lines)
         next_()
       end
       i = i - 1
-      blocks[#blocks + 1] = { kind = 'table', rows = rows }
+      blocks[#blocks + 1] = { kind = 'table', rows = rows, n = #rows + 1 }
     else
-      blocks[#blocks + 1] = { kind = 'paragraph', segs = inline(line) }
+      blocks[#blocks + 1] = { kind = 'paragraph', segs = inline(line), n = 1 }
     end
     next_()
   end
@@ -393,9 +401,96 @@ local function clear(buf)
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
 end
 
--- The raw line is fully concealed so it takes no room (no wrapping, no bleed
--- through) and the rendered text is drawn over it. Neovim's undo is untouched
--- because the buffer text is never changed.
+----------------------------------------------------------------------
+-- inline markup: conceal the syntax, keep the text real so the cursor
+-- can move over the rendered line
+----------------------------------------------------------------------
+
+-- pat must capture the visible text as group 1; plen is the byte length of
+-- the opening markup so the concealed range can be located.
+local INLINE_SPECS = {
+  { pat = '`([^`]+)`', plen = 1, group = 'MarkdownConsoleCode' },
+  { pat = '!%[([^%]]*)%]%(([^%)]*)%)', plen = 2, group = 'MarkdownConsoleImage' },
+  { pat = '%[([^%]]*)%]%(([^%)]*)%)', plen = 1, group = 'MarkdownConsoleLink' },
+  { pat = '%*%*([^%*]+)%*%*', plen = 2, group = 'MarkdownConsoleBold' },
+  { pat = '__([^_]+)__', plen = 2, group = 'MarkdownConsoleBold' },
+  { pat = '%*([^%*]+)%*', plen = 1, group = 'MarkdownConsoleItalic' },
+  { pat = '_([^_]+)_', plen = 1, group = 'MarkdownConsoleItalic' },
+}
+
+local function conceal(buf, row, c0, c1)
+  if c1 > c0 then
+    pcall(vim.api.nvim_buf_set_extmark, buf, ns, row, c0, { end_col = c1, conceal = '' })
+  end
+end
+
+local function paint(buf, row, c0, c1, group)
+  if group and c1 > c0 then
+    pcall(vim.api.nvim_buf_set_extmark, buf, ns, row, c0, { end_col = c1, hl_group = group })
+  end
+end
+
+-- Conceal the syntax of one inline region of `text` (which starts at byte
+-- offset `off` in the row) and highlight the text that remains. `base` styles
+-- plain runs.
+local function inline_row(buf, row, text, off, base)
+  local pos = 1
+  while pos <= #text do
+    local best
+    for _, sp in ipairs(INLINE_SPECS) do
+      local s, e, cap = text:find(sp.pat, pos)
+      if s and (not best or s < best.s) then
+        best = { s = s, e = e, cap = cap, plen = sp.plen, group = sp.group }
+      end
+    end
+    if not best then
+      paint(buf, row, off + pos - 1, off + #text, base)
+      return
+    end
+    local s, e, plen = best.s, best.e, best.plen
+    local ks = s + plen
+    local ke = ks + #best.cap - 1
+    if s > pos then paint(buf, row, off + pos - 1, off + s - 1, base) end
+    conceal(buf, row, off + s - 1, off + ks - 1)
+    paint(buf, row, off + ks - 1, off + ke, best.group)
+    conceal(buf, row, off + ke, off + e)
+    pos = e + 1
+  end
+end
+
+-- Conceal a block marker and draw a replacement with inline virtual text.
+local function marker(buf, row, len, text, group)
+  conceal(buf, row, 0, len)
+  pcall(vim.api.nvim_buf_set_extmark, buf, ns, row, 0, {
+    virt_text = { { text, group } },
+    virt_text_pos = 'inline',
+  })
+end
+
+-- Structural blocks (code boxes, tables) keep the whole-line overlay: their
+-- rendered form has a different shape from the source.
+local function overlay_row(buf, row, line, row_data)
+  if not row_data or #row_data.chunks == 0 then
+    conceal(buf, row, 0, #line)
+    return
+  end
+  local width = 0
+  for _, c in ipairs(row_data.chunks) do width = width + tw(c[1]) end
+  local target = math.max(width, row_data.min or 0)
+  if target > width then
+    local space = string.rep(' ', target - width)
+    row_data.chunks[#row_data.chunks + 1] = row_data.fill and { space, row_data.fill } or { space }
+  end
+  pcall(vim.api.nvim_buf_set_extmark, buf, ns, row, 0, {
+    end_col = #line,
+    conceal = '',
+    virt_text = row_data.chunks,
+    virt_text_pos = 'overlay',
+    hl_mode = 'replace',
+    priority = 100,
+  })
+end
+
 local function render(buf, force)
   if busy or not md(buf) or not shown(buf) then return end
   if rendered[buf] and not force then
@@ -412,31 +507,77 @@ local function render(buf, force)
     local bar = text_width(vim.fn.bufwinid(buf)) - 2
     local rows = build_rows(lines, bar)
     clear(buf)
-    for i = 1, #lines do
-      local row = rows[i]
-      if row and #row.chunks > 0 then
-        local width = 0
-        for _, c in ipairs(row.chunks) do width = width + tw(c[1]) end
-        local target = math.max(width, row.min or 0)
-        if target > width then
-          local space = string.rep(' ', target - width)
-          row.chunks[#row.chunks + 1] = row.fill and { space, row.fill } or { space }
+    -- Conceal hides the markup but does NOT shrink the width Neovim wraps at,
+    -- so a source line wider than the window would wrap and drop a stray
+    -- fragment (with leading blanks) onto the next row. Conceal-render only the
+    -- lines that fit; anything wider falls back to the whole-line overlay.
+    local avail = text_width(vim.fn.bufwinid(buf)) - 1
+    local function fits(line)
+      return tw(line) <= avail
+    end
+    local li = 0
+    for _, b in ipairs(parse(lines)) do
+      if b.kind == 'code' or b.kind == 'table' then
+        for _ = 1, b.n do
+          li = li + 1
+          if li > #lines then break end
+          overlay_row(buf, li - 1, lines[li], rows[li])
         end
-        pcall(vim.api.nvim_buf_set_extmark, buf, ns, i - 1, 0, {
-          end_col = #lines[i],
-          conceal = '',
-          virt_text = row.chunks,
-          virt_text_pos = 'overlay',
-          hl_mode = 'replace',
-          priority = 100,
-        })
-      else
-        -- nothing to show (blank line): still conceal so nothing bleeds
-        if #lines[i] > 0 then
-          pcall(vim.api.nvim_buf_set_extmark, buf, ns, i - 1, 0, {
-            end_col = #lines[i], conceal = '',
+      elseif b.kind == 'heading' then
+        li = li + 1
+        local line = lines[li]
+        if fits(line) then
+          local hashes = line:match('^(#+)%s')
+          local prefix = #hashes + 1
+          local group = 'MarkdownConsoleH' .. b.level
+          local pgroup = b.level == 1 and 'MarkdownConsoleH1Prefix' or 'MarkdownConsoleHPrefix'
+          pcall(vim.api.nvim_buf_set_extmark, buf, ns, li - 1, 0, {
+            end_col = #line, hl_group = group, hl_eol = b.level == 1,
           })
+          paint(buf, li - 1, 0, prefix, pgroup)
+          if #line > prefix then inline_row(buf, li - 1, line:sub(prefix + 1), prefix, group) end
+        else
+          overlay_row(buf, li - 1, line, rows[li])
         end
+      elseif b.kind == 'paragraph' then
+        li = li + 1
+        if fits(lines[li]) then
+          inline_row(buf, li - 1, lines[li], 0, nil)
+        else
+          overlay_row(buf, li - 1, lines[li], rows[li])
+        end
+      elseif b.kind == 'list' then
+        li = li + 1
+        local line = lines[li]
+        if fits(line) then
+          local m = line:match('^(%s*[%-%*+]%s+)') or line:match('^(%s*%d+%.%s+)') or ''
+          local bullet = b.marker == '-' and '  • ' or ('  ' .. b.marker .. '. ')
+          marker(buf, li - 1, #m, bullet, 'MarkdownConsoleList')
+          inline_row(buf, li - 1, line:sub(#m + 1), #m, nil)
+        else
+          overlay_row(buf, li - 1, line, rows[li])
+        end
+      elseif b.kind == 'quote' then
+        for _ = 1, b.n do
+          li = li + 1
+          local line = lines[li]
+          if fits(line) then
+            local m = line:match('^(%s*>%s?)') or ''
+            marker(buf, li - 1, #m, '▏ ', 'MarkdownConsoleQuote')
+            inline_row(buf, li - 1, line:sub(#m + 1), #m, 'MarkdownConsoleQuote')
+          else
+            overlay_row(buf, li - 1, line, rows[li])
+          end
+        end
+      elseif b.kind == 'hr' then
+        li = li + 1
+        if fits(lines[li]) then
+          marker(buf, li - 1, #lines[li], string.rep('─', 40), 'MarkdownConsoleHr')
+        else
+          overlay_row(buf, li - 1, lines[li], rows[li])
+        end
+      else
+        li = li + b.n
       end
     end
     set_win_opt(buf, 'conceallevel', 2)
