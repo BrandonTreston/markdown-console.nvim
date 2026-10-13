@@ -77,13 +77,20 @@ also shows the raw source. `:MarkdownConsoleToggle` flips the view manually.
 
 ## How It Works
 
-1. The buffer always holds the raw source. In normal mode each source line gets
-   an extmark that fully conceals it and draws the rendered form as an overlay
-   (`virt_text_pos = "overlay"`) with its own highlights.
-2. Entering an editing mode clears the overlay and turns conceal off, so the raw
+1. The buffer always holds the raw source. In normal mode text lines (headings,
+   paragraphs, lists, quotes) conceal their markdown syntax with extmarks and
+   keep the text itself real, so the cursor moves over the rendered line and it
+   wraps with `wrap` like any other line.
+2. Blocks whose rendered shape differs from the source (code boxes, tables,
+   mermaid diagrams) get an extmark that fully conceals the block and draws the
+   rendered form as an overlay (`virt_text_pos = "overlay"`).
+3. Conceal does not shrink the width Neovim wraps at, so a text line that would
+   wrap *and* hide a long run (a URL) is left as raw source instead, which wraps
+   cleanly without a gap.
+4. Entering an editing mode clears the view and turns conceal off, so the raw
    source reappears; leaving it renders again. This is driven entirely by
    `ModeChanged`, so every editing entry point is covered.
-3. The buffer text is never touched, so `u`/`<C-r>` behave natively, the
+5. The buffer text is never touched, so `u`/`<C-r>` behave natively, the
    `modified` flag reflects only your own edits, and saving writes the buffer
    directly (no `BufWriteCmd`).
 
