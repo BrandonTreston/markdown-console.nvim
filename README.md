@@ -1,8 +1,8 @@
 # markdown-console.nvim
 
 Shows a rendered view of a markdown buffer in normal mode and the raw source
-while you are editing. The buffer always holds the source; only the view is
-swapped in and out.
+while you are editing. The buffer always holds the source; the rendered form is
+drawn over it as a virtual overlay, so nothing is ever written to the buffer.
 
 ## Features
 
@@ -21,6 +21,8 @@ swapped in and out.
   (`i`, `a`, `o`, `cc`, `s`, `R`, `v`, `<Esc>`, ...) switches the view
 - **`:MarkdownConsoleToggle`** to switch the view by hand
 - **Saving** writes the raw markdown source, never the rendered view
+- **Native undo**: because the buffer text is never changed, `u`/`<C-r>` work
+  for every edit, in normal *and* insert mode
 - **Non-intrusive**: viewing a file never marks the buffer modified and never
   becomes an undo step
 
@@ -65,17 +67,20 @@ also shows the raw source. `:MarkdownConsoleToggle` flips the view manually.
   them (`MarkdownConsoleH1` ... `MarkdownConsoleH6`, `MarkdownConsoleCode`,
   `MarkdownConsoleLink`, ...) from your own colorscheme or config.
 - The plugin turns Neovim's native markdown highlighter off for the buffers it
-  manages, because it replaces the whole buffer and draws its own highlights.
+  manages, because it draws its own highlights and full-line conceal over the raw
+  text.
 
 ## How It Works
 
-1. When a markdown buffer is shown in normal mode it is parsed and the rendered
-   lines are written into the buffer, with highlights applied as extmarks.
-2. Entering an editing mode restores the saved source lines; leaving it renders
-   again. This is driven entirely by `ModeChanged`, so every editing entry point
-   is covered.
-3. Saving goes through `BufWriteCmd`, which writes the saved source lines to
-   disk without touching the buffer.
+1. The buffer always holds the raw source. In normal mode each source line gets
+   an extmark that fully conceals it and draws the rendered form as an overlay
+   (`virt_text_pos = "overlay"`) with its own highlights.
+2. Entering an editing mode clears the overlay and turns conceal off, so the raw
+   source reappears; leaving it renders again. This is driven entirely by
+   `ModeChanged`, so every editing entry point is covered.
+3. The buffer text is never touched, so `u`/`<C-r>` behave natively, the
+   `modified` flag reflects only your own edits, and saving writes the buffer
+   directly (no `BufWriteCmd`).
 
 ## Commands
 

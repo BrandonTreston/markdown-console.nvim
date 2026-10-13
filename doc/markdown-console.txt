@@ -16,7 +16,8 @@ CONTENTS                                              *markdown-console-contents
 
 markdown-console shows a rendered view of a markdown buffer in normal mode
 and the raw source while you are editing. The buffer always holds the source;
-only the view is swapped in and out.
+the rendered form is drawn over it as a virtual overlay, so nothing is ever
+written to the buffer.
 
   - Normal mode: rendered markdown with highlight groups. Headings (level 1
     has a full-width background bar, level 2 is underlined, levels 3-6 are
@@ -24,6 +25,8 @@ only the view is swapped in and out.
     borders and optional treesitter syntax highlighting, blockquotes, tables,
     horizontal rules, and inline styling.
   - Editing (insert, replace, visual): raw markdown source.
+  - Native |undo| and redo work for every edit (normal and insert), because the
+    buffer text is never changed.
   - Viewing a file never marks the buffer modified and never becomes an undo
     step. Saving always writes the raw source.
 
@@ -72,30 +75,32 @@ config can override any of them.
     MarkdownConsoleH1 .. MarkdownConsoleH6   heading levels
     MarkdownConsoleHPrefix                   "#" prefix of headings
     MarkdownConsoleH1Prefix                  "#" prefix of level-1 headings
-    MarkdownConsoleBullet                    list markers
+    MarkdownConsoleList                      bullet / numbered markers
     MarkdownConsoleQuote                     blockquote prefix
-    MarkdownConsoleQuoteText                 blockquote text
-    MarkdownConsoleRule                      horizontal rule
     MarkdownConsoleCode                      code block text
-    MarkdownConsoleCodeBorder                code block border
+    MarkdownConsoleFence                     code fence border
     MarkdownConsoleCodeLang                  code block language label
-    MarkdownConsoleTableBorder               table separators
-    MarkdownConsoleTableHeader               table header row
+    MarkdownConsoleHr                        horizontal rule
     MarkdownConsoleBold                      **bold**
     MarkdownConsoleItalic                    *italic*
-    MarkdownConsoleCodeInline                `inline code`
     MarkdownConsoleLink                      [links](url)
+    MarkdownConsoleImage                     ![images](url)
+    MarkdownConsoleTableHeader               table header row
+    MarkdownConsoleTableRow                  table body rows
+    MarkdownConsoleTableSep                  table column separators
 
 ==============================================================================
 6. HOW IT WORKS                                      *markdown-console-how*
 
-  1. When a markdown buffer is shown in normal mode it is parsed and the
-     rendered lines are written into the buffer, with highlights applied as
-     extmarks.
-  2. Entering an editing mode restores the saved source lines; leaving it
-     renders again.
-  3. Saving goes through |BufWriteCmd|, which writes the saved source lines to
-     disk without touching the buffer.
+  1. The buffer always holds the raw source. In normal mode each source line
+     gets an extmark that fully conceals it and draws the rendered form as an
+     overlay (|virt_text_pos| = "overlay") with its own highlights.
+  2. Entering an editing mode clears the overlay and turns conceal off, so the
+     raw source reappears; leaving it renders again. This is driven by
+     |ModeChanged|.
+  3. The buffer text is never touched, so |undo| and redo behave natively, the
+     'modified' flag reflects only your own edits, and saving writes the buffer
+     directly (no |BufWriteCmd|).
 
 ==============================================================================
 7. LICENSE                                           *markdown-console-license*

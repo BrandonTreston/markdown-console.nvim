@@ -1,47 +1,34 @@
 -- markdown-console.nvim
 --
 -- Shows a rendered view of a markdown buffer while you are in normal mode and
--- the raw source while you are editing (insert / replace / visual). The buffer
--- itself always holds the source; only the view is swapped in and out.
+-- the raw source while you are editing (insert / replace / visual).
 --
--- The plugin does its own highlighting, so it keeps the native treesitter
--- highlighter switched off for the buffers it manages. Replacing a whole buffer
--- while a highlighter is parsing leaves the language tree holding nodes that no
--- longer exist, which raises "attempt to call method 'range' (a nil value)" on
--- the next redraw and breaks the switch back to raw.
+-- The buffer text is NEVER changed. The rendered view is drawn as a per-line
+-- overlay (virt_text_pos = "overlay"): for each source line an extmark draws the
+-- rendered form on top of the raw text and, where the rendered form is shorter,
+-- pads it so the raw text underneath is fully hidden. Entering an editing mode
+-- simply clears the overlay, so the raw source reappears.
+--
+-- Because the buffer is left alone, Neovim's own undo/redo works for every edit
+-- (insert and normal alike), the buffer only becomes 'modified' when you
+-- actually edit it, and saving writes the buffer directly - no BufWriteCmd.
 
 local M = {}
 
 local ns = vim.api.nvim_create_namespace('markdown_console')
 
--- bufnr -> raw source lines, present only while the rendered view is shown
-local managed = {}
--- reentrancy guard for the whole render/restore cycle
+-- bufnr -> true while the rendered overlay is shown
+local rendered = {}
+-- reentrancy guard
 local busy = false
+
+local function tw(s)
+  return vim.fn.strdisplaywidth(s)
+end
 
 ----------------------------------------------------------------------
 -- buffer helpers
 ----------------------------------------------------------------------
-
--- Replace the whole buffer for a view swap. Undo is disabled for the change so
--- the swap itself never becomes an undo step, and the 'modified' flag is
--- restored so viewing never makes the buffer look edited. The cursor is kept in
--- place (clamped to the new text) so editing continues where it was.
-local function set_lines(buf, lines)
-  local win = vim.fn.bufwinid(buf)
-  local cur = win ~= -1 and vim.api.nvim_win_get_cursor(win) or nil
-  local bo = vim.bo[buf]
-  local old_undolevels, old_modified = bo.undolevels, bo.modified
-  bo.undolevels = -1
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  bo.undolevels = old_undolevels
-  bo.modified = old_modified
-  if cur and vim.api.nvim_win_is_valid(win) then
-    local line = math.min(cur[1], vim.api.nvim_buf_line_count(buf))
-    local text = vim.api.nvim_buf_get_lines(buf, line - 1, line, false)[1] or ''
-    pcall(vim.api.nvim_win_set_cursor, win, { line, math.min(cur[2], #text) })
-  end
-end
 
 local function ts_off(buf)
   if vim.treesitter and vim.treesitter.highlighter then
@@ -139,8 +126,8 @@ local TS_LANG = {
 }
 
 -- Returns { [line_index] = { {start, end, group}, ... } } for the block, or nil
--- when there is no parser / query for the language. Errors are swallowed: a
--- missing parser must never stop the block from rendering.
+-- when there is no parser / query for the language. Ranges are 0-based bytes.
+-- Errors are swallowed: a missing parser must never stop the block rendering.
 local function code_marks(body, lang)
   local ts_lang = TS_LANG[lang:lower()]
   if not ts_lang then return nil end
@@ -168,6 +155,30 @@ local function code_marks(body, lang)
   return ok and res or nil
 end
 
+-- Turn a code line plus its treesitter ranges into highlight chunks.
+local function code_chunks(line, marks)
+  local cs = {}
+  if not marks or #marks == 0 then
+    if #line > 0 then cs[#cs + 1] = { line, 'MarkdownConsoleCode' } end
+    return cs
+  end
+  table.sort(marks, function(a, b) return a[1] < b[1] end)
+  local pos = 0
+  for _, m in ipairs(marks) do
+    local s, e, g = m[1], m[2], m[3]
+    if s >= pos then
+      if s > pos then cs[#cs + 1] = { line:sub(pos + 1, s), 'MarkdownConsoleCode' } end
+      if e > s then cs[#cs + 1] = { line:sub(s + 1, e), g } end
+      if e > pos then pos = e end
+    elseif e > pos then
+      -- overlapping tail of a nested capture
+      cs[#cs + 1] = { line:sub(pos + 1, e), g }
+      pos = e
+    end
+  end
+  if pos < #line then cs[#cs + 1] = { line:sub(pos + 1), 'MarkdownConsoleCode' } end
+  return cs
+end
 
 ----------------------------------------------------------------------
 -- block parsing
@@ -231,118 +242,96 @@ local function parse(lines)
 end
 
 ----------------------------------------------------------------------
--- rendering
+-- rendering: one row per source line, as highlight chunks
 ----------------------------------------------------------------------
 
 local function box_width(cells)
   return math.max(40, math.min(100, cells + 3))
 end
 
-local function display_width(text)
-  return vim.fn.strdisplaywidth(text)
-end
-
 local function pad(text, cells)
-  return text .. string.rep(' ', math.max(0, cells - display_width(text)))
+  return text .. string.rep(' ', math.max(0, cells - tw(text)))
 end
 
--- Build the displayed lines and the per-line highlight marks.
--- bar = width to pad level-1 headings to (for a full-width background bar).
--- Returns { lines = { string }, marks = { [line_idx] = { {start,end,group}, ... } } }
-local function build(lines, bar)
-  local out, marks = {}, {}
-  local idx = 0
+-- Build one row (list of {text, hl} chunks) for each source line, so the rows
+-- line up 1:1 with the buffer and can be overlaid directly. Each row may carry:
+--   fill  - highlight group used for the padding that hides the raw text
+--   min   - minimum display width (full-width level-1 heading bar)
+local function build_rows(lines, bar)
+  local rows = {}
 
-  local function push(text, line_marks)
-    out[#out + 1] = text
-    if line_marks then marks[idx] = line_marks end
-    idx = idx + 1
+  local function put(chunks, fill, min)
+    rows[#rows + 1] = { chunks = chunks or {}, fill = fill, min = min }
   end
 
-  local function push_segs(prefix, prefix_group, segs, base_group)
-    local text, lm, col = prefix, {}, #prefix
-    if prefix_group and #prefix > 0 then lm[#lm + 1] = { 0, #prefix, prefix_group } end
+  local function plain(segs, base)
+    local cs = {}
     for _, s in ipairs(segs) do
-      if base_group and #s.text > 0 then lm[#lm + 1] = { col, col + #s.text, base_group } end
-      if s.hl and #s.text > 0 then lm[#lm + 1] = { col, col + #s.text, s.hl } end
-      text = text .. s.text
-      col = col + #s.text
+      if #s.text > 0 then
+        cs[#cs + 1] = (s.hl or base) and { s.text, s.hl or base } or { s.text }
+      end
     end
-    push(text, lm)
+    return cs
   end
 
   for _, b in ipairs(parse(lines)) do
     if b.kind == 'blank' then
-      push('')
+      put({})
 
     elseif b.kind == 'heading' then
-      local prefix = string.rep('#', b.level) .. ' '
       local base = 'MarkdownConsoleH' .. b.level
       local pgroup = b.level == 1 and 'MarkdownConsoleH1Prefix' or 'MarkdownConsoleHPrefix'
-      local text = prefix
-      for _, s in ipairs(b.segs) do text = text .. s.text end
-      -- level 1 gets a full-width background bar
-      if b.level == 1 and bar and #text < bar then text = pad(text, bar) end
-      local lm = { { 0, #text, base }, { 0, #prefix, pgroup } }
-      local col = #prefix
+      local cs = { { string.rep('#', b.level) .. ' ', pgroup } }
       for _, s in ipairs(b.segs) do
-        if s.hl and #s.text > 0 then lm[#lm + 1] = { col, col + #s.text, s.hl } end
-        col = col + #s.text
+        cs[#cs + 1] = (s.hl and { s.text, s.hl }) or { s.text, base }
       end
-      push(text, lm)
+      put(cs, base, b.level == 1 and bar or nil)
 
     elseif b.kind == 'paragraph' then
-      push_segs('', nil, b.segs, nil)
+      put(plain(b.segs, nil))
 
     elseif b.kind == 'list' then
       local prefix = b.marker == '-' and '  • ' or ('  ' .. b.marker .. '. ')
-      push_segs(prefix, 'MarkdownConsoleList', b.segs, nil)
+      local cs = { { prefix, 'MarkdownConsoleList' } }
+      for _, s in ipairs(plain(b.segs, nil)) do cs[#cs + 1] = s end
+      put(cs)
 
     elseif b.kind == 'hr' then
-      push(string.rep('─', 40), { { 0, 40 * #'─', 'MarkdownConsoleHr' } })
+      put({ { string.rep('─', 40), 'MarkdownConsoleHr' } })
 
     elseif b.kind == 'quote' then
       for _, q in ipairs(b.lines) do
-        push_segs('▏ ', 'MarkdownConsoleQuote', q, 'MarkdownConsoleQuote')
+        local cs = { { '▏ ', 'MarkdownConsoleQuote' } }
+        for _, s in ipairs(plain(q, 'MarkdownConsoleQuote')) do cs[#cs + 1] = s end
+        put(cs)
       end
 
     elseif b.kind == 'code' then
       local widest = 0
-      for _, l in ipairs(b.lines) do widest = math.max(widest, display_width(l)) end
-      local width = box_width(math.max(widest, b.lang ~= '' and (display_width(b.lang) + 1) or 0))
+      for _, l in ipairs(b.lines) do widest = math.max(widest, tw(l)) end
+      local extra = b.lang ~= '' and (tw(b.lang) + 4) or 0
+      local width = box_width(math.max(widest, extra))
       local inner = width - 2
-      local fence = 'MarkdownConsoleFence'
-      local function boxline(content)
-        local line = '│' .. pad(content, inner) .. '│'
-        push(line, { { 0, #line, fence } })
-      end
-      local top = '┌' .. string.rep('─', inner) .. '┐'
-      local bot = '└' .. string.rep('─', inner) .. '┘'
-      push(top, { { 0, #top, fence } })
-      local langline = ' ' .. b.lang
-      local lm = { { 0, #('│' .. pad(langline, inner) .. '│'), fence } }
+      local Fence = 'MarkdownConsoleFence'
+      -- The language label rides on the top border so the block stays exactly
+      -- as many rows as it has source lines.
       if b.lang ~= '' then
-        lm[#lm + 1] = { #'│' + 1, #'│' + 1 + #b.lang, 'MarkdownConsoleCodeLang' }
+        local head = '─ ' .. b.lang .. ' '
+        local dashes = string.rep('─', math.max(0, inner - tw(head)))
+        put({ { '┌─ ', Fence }, { b.lang, 'MarkdownConsoleCodeLang' }, { ' ' .. dashes .. '┐', Fence } })
+      else
+        put({ { '┌' .. string.rep('─', inner) .. '┐', Fence } })
       end
-      push('│' .. pad(langline, inner) .. '│', lm)
-      local start = idx
-      for _, l in ipairs(b.lines) do
-        boxline(' ' .. l)
+      local cm = code_marks(b.lines, b.lang) or {}
+      for k, l in ipairs(b.lines) do
+        local cs = { { '│', Fence }, { ' ', 'MarkdownConsoleCode' } }
+        for _, c in ipairs(code_chunks(l, cm[k])) do cs[#cs + 1] = c end
+        local fillw = math.max(0, inner - 1 - tw(l))
+        if fillw > 0 then cs[#cs + 1] = { string.rep(' ', fillw), Fence } end
+        cs[#cs + 1] = { '│', Fence }
+        put(cs)
       end
-      -- base colour for the code body, then optional treesitter highlights on
-      -- top (later extmarks win); the body starts four bytes in, after "│ ".
-      for k = start, idx - 1 do
-        marks[k] = { { 0, #out[k + 1], 'MarkdownConsoleCode' } }
-      end
-      for line, list in pairs(code_marks(b.lines, b.lang) or {}) do
-        for _, m in ipairs(list) do
-          local target = marks[start + line]
-          if target then
-            target[#target + 1] = { 4 + m[1], math.min(4 + m[2], #out[start + line + 1]), m[3] }
-          end
-        end
-      end
-      push(bot, { { 0, #bot, fence } })
+      put({ { '└' .. string.rep('─', inner) .. '┘', Fence } })
 
     elseif b.kind == 'table' then
       local ncol = 0
@@ -351,50 +340,88 @@ local function build(lines, bar)
       for c = 1, ncol do
         for _, r in ipairs(b.rows) do
           local cell = r[c] or ''
-          widths[c] = math.max(widths[c] or 0, display_width(seg_text(inline(cell))))
+          widths[c] = math.max(widths[c] or 0, tw(seg_text(inline(cell))))
         end
       end
       for ri, r in ipairs(b.rows) do
         local cells = {}
-        for c = 1, ncol do
-          cells[c] = pad(seg_text(inline(r[c] or '')), widths[c])
-        end
+        for c = 1, ncol do cells[c] = pad(seg_text(inline(r[c] or '')), widths[c]) end
         local line = ' ' .. table.concat(cells, ' │ ') .. ' '
-        push(line, { { 0, #line, ri == 1 and 'MarkdownConsoleTableHeader' or 'MarkdownConsoleTableRow' } })
+        put({ { line, ri == 1 and 'MarkdownConsoleTableHeader' or 'MarkdownConsoleTableRow' } })
         if ri == 1 then
-          local sep = string.rep('─', display_width(line))
-          push(sep, { { 0, #sep, 'MarkdownConsoleTableSep' } })
+          put({ { string.rep('─', tw(line)), 'MarkdownConsoleTableSep' } })
         end
       end
     end
   end
 
-  return { lines = out, marks = marks }
+  return rows
 end
 
 ----------------------------------------------------------------------
--- view switching
+-- overlay
 ----------------------------------------------------------------------
 
+-- Set a window option on every window showing the buffer.
+local function set_win_opt(buf, name, val)
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+    if vim.api.nvim_win_is_valid(win) then vim.wo[win][name] = val end
+  end
+end
+
+local function clear(buf)
+  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+end
+
+-- The raw line is fully concealed so it takes no room (no wrapping, no bleed
+-- through) and the rendered text is drawn over it. Neovim's undo is untouched
+-- because the buffer text is never changed.
 local function render(buf, force)
   if busy or not md(buf) or not shown(buf) then return end
-  if managed[buf] and not force then return end
+  if rendered[buf] and not force then
+    set_win_opt(buf, 'conceallevel', 2)
+    set_win_opt(buf, 'concealcursor', 'n')
+    return
+  end
   busy = true
   local ok, err = pcall(function()
-    local raw = managed[buf] or vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    local built = build(raw, text_width(vim.fn.bufwinid(buf)) - 2)
+    -- Native highlighting must be off before conceal is enabled: the treesitter
+    -- conceal_line decoration provider errors on a live tree.
     ts_off(buf)
-    set_lines(buf, built.lines)
-    managed[buf] = raw
-    vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
-    for line, line_marks in pairs(built.marks) do
-      for _, m in ipairs(line_marks) do
-        pcall(vim.api.nvim_buf_set_extmark, buf, ns, line, m[1], {
-          end_col = m[2],
-          hl_group = m[3],
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local bar = text_width(vim.fn.bufwinid(buf)) - 2
+    local rows = build_rows(lines, bar)
+    clear(buf)
+    for i = 1, #lines do
+      local row = rows[i]
+      if row and #row.chunks > 0 then
+        local width = 0
+        for _, c in ipairs(row.chunks) do width = width + tw(c[1]) end
+        local target = math.max(width, row.min or 0)
+        if target > width then
+          local space = string.rep(' ', target - width)
+          row.chunks[#row.chunks + 1] = row.fill and { space, row.fill } or { space }
+        end
+        pcall(vim.api.nvim_buf_set_extmark, buf, ns, i - 1, 0, {
+          end_col = #lines[i],
+          conceal = '',
+          virt_text = row.chunks,
+          virt_text_pos = 'overlay',
+          hl_mode = 'replace',
+          priority = 100,
         })
+      else
+        -- nothing to show (blank line): still conceal so nothing bleeds
+        if #lines[i] > 0 then
+          pcall(vim.api.nvim_buf_set_extmark, buf, ns, i - 1, 0, {
+            end_col = #lines[i], conceal = '',
+          })
+        end
       end
     end
+    set_win_opt(buf, 'conceallevel', 2)
+    set_win_opt(buf, 'concealcursor', 'n')
+    rendered[buf] = true
   end)
   busy = false
   if not ok then
@@ -403,20 +430,17 @@ local function render(buf, force)
 end
 
 local function restore(buf)
-  if busy then return end
-  local raw = managed[buf]
-  if not raw or not shown(buf) then return end
+  if busy or not rendered[buf] then return end
   busy = true
-  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
-  ts_off(buf)
-  set_lines(buf, raw)
-  managed[buf] = nil
+  clear(buf)
+  set_win_opt(buf, 'conceallevel', 0)
+  rendered[buf] = nil
   busy = false
 end
 
 local function toggle()
   local buf = vim.api.nvim_get_current_buf()
-  if managed[buf] then restore(buf) else render(buf) end
+  if rendered[buf] then restore(buf) else render(buf, true) end
 end
 
 ----------------------------------------------------------------------
@@ -470,19 +494,20 @@ function M.setup()
 
   setup_highlights()
 
-  -- nvim-treesitter (and others) start the native highlighter on FileType; let
-  -- them run, then switch it back off for markdown buffers.
+  -- nvim-treesitter (and others) start the native highlighter on FileType; the
+  -- overlay draws its own highlights, so switch it back off for markdown.
   vim.api.nvim_create_autocmd('FileType', {
     pattern = 'markdown',
     callback = function(args)
       local buf = args.buf
+      ts_off(buf)
       vim.schedule(function()
         if vim.api.nvim_buf_is_valid(buf) then ts_off(buf) end
       end)
     end,
   })
 
-  -- Render when a managed markdown buffer is shown while in normal mode.
+  -- Draw the overlay when a managed markdown buffer is shown in normal mode.
   vim.api.nvim_create_autocmd({ 'BufWinEnter', 'BufEnter' }, {
     pattern = MD_PATTERN,
     callback = function(args)
@@ -491,9 +516,7 @@ function M.setup()
   })
 
   -- Raw source while editing, rendered view otherwise. ModeChanged covers every
-  -- transition into and out of an editing mode (insert, replace, visual). Only
-  -- react to entering/leaving an editing mode, so a manual toggle back to raw is
-  -- not undone when the command line is left.
+  -- transition into and out of an editing mode (insert, replace, visual).
   vim.api.nvim_create_autocmd('ModeChanged', {
     callback = function(args)
       if not md(args.buf) then return end
@@ -512,41 +535,31 @@ function M.setup()
     end,
   })
 
-  -- Write the source to disk. While the rendered view is shown the buffer holds
-  -- the rendered text, so write raw straight from the saved copy; doing this
-  -- through BufWriteCmd keeps the buffer (and its undo history) untouched.
-  vim.api.nvim_create_autocmd('BufWriteCmd', {
-    pattern = MD_PATTERN,
+  -- A normal-mode edit (or an undo/redo) changes the text under the overlay, so
+  -- redraw it to match. Only in normal mode; the overlay is cleared while editing.
+  vim.api.nvim_create_autocmd('TextChanged', {
     callback = function(args)
-      local buf = args.buf
-      local raw = managed[buf] or vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-      local name = args.file ~= '' and args.file or vim.api.nvim_buf_get_name(buf)
-      local sep = vim.bo[buf].fileformat == 'dos' and '\r\n' or '\n'
-      local text = table.concat(raw, sep)
-      if vim.bo[buf].endofline then text = text .. sep end
-      local fd, err = io.open(name, 'wb')
-      if not fd then
-        vim.notify('markdown-console: write failed: ' .. tostring(err), vim.log.levels.ERROR)
-        return
-      end
-      fd:write(text)
-      fd:close()
-      vim.bo[buf].modified = false
-    end,
-  })
-
-  vim.api.nvim_create_autocmd({ 'BufWipeout', 'BufDelete' }, {
-    callback = function(args)
-      managed[args.buf] = nil
+      if not md(args.buf) or is_raw_mode(vim.fn.mode(1)) then return end
+      vim.schedule(function()
+        if vim.api.nvim_buf_is_valid(args.buf) and not is_raw_mode(vim.fn.mode(1)) then
+          render(args.buf, true)
+        end
+      end)
     end,
   })
 
   -- Keep the level-1 background bar spanning the window.
   vim.api.nvim_create_autocmd({ 'VimResized', 'WinResized' }, {
     callback = function()
-      for buf in pairs(managed) do
+      for buf in pairs(rendered) do
         if vim.api.nvim_buf_is_valid(buf) then render(buf, true) end
       end
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ 'BufWipeout', 'BufDelete' }, {
+    callback = function(args)
+      rendered[args.buf] = nil
     end,
   })
 
