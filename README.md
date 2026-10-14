@@ -97,9 +97,10 @@ also shows the raw source. `:MarkdownConsoleToggle` flips the view manually.
    drawn as `virt_lines` on the neighbouring row; while the cursor is on such a
    table it is rendered inline instead (see `render_table_inline`) so it stays
    navigable.
-3. Conceal does not shrink the width Neovim wraps at, so a text line that would
-   wrap *and* hide a long run (a URL) is left as raw source instead, which wraps
-   cleanly without a gap.
+3. Conceal does not shrink the width Neovim wraps at, so hiding a run (a URL)
+   on a line that wraps leaves a gap as wide as the run on that row. Links are
+   still shortened on wrapped lines; only a run wide enough to blank a whole
+   wrapped row (a URL longer than the window) leaves the line as raw source.
 4. Entering an editing mode clears the view and turns conceal off, so the raw
    source reappears; leaving it renders again. This is driven entirely by
    `ModeChanged`, so every editing entry point is covered.

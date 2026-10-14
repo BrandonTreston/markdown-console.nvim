@@ -574,11 +574,10 @@ local function inline_row(buf, row, text, off, base)
 end
 
 -- Conceal does not shrink the width Neovim wraps at, so hiding a long run (a
--- URL) on a line that wraps would leave a blank gap on the wrapped row. Return
--- the widest single run inline_row would conceal on this text, so a wrapping
--- line that would gape badly can be left as raw source. `text` must be the same
--- slice inline_row is given.
-local CONCEAL_MAX = 10
+-- URL) on a line that wraps leaves a gap as wide as the run on the wrapped row.
+-- Return the widest single run inline_row would conceal on this text, so a
+-- wrapping line whose run is wide enough to blank a whole row can be left as raw
+-- source. `text` must be the same slice inline_row is given.
 local function conceal_max(text)
   local worst, pos = 0, 1
   while pos <= #text do
@@ -827,8 +826,11 @@ local function render(buf, force)
     local function fits(line)
       return tw(line) <= avail
     end
+    -- Conceal a line when it fits (so it cannot wrap), or when its widest
+    -- concealed run is narrower than the window: a hidden run that can span a
+    -- whole wrapped row would leave a blank row, so those lines stay raw.
     local function text_ok(line, seg)
-      return fits(line) or conceal_max(seg) <= CONCEAL_MAX
+      return fits(line) or conceal_max(seg) < avail
     end
     local li = 0
     for _, b in ipairs(parse(lines)) do

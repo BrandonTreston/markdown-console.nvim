@@ -105,9 +105,10 @@ config can override any of them.
      gaps. While the cursor is inside a wide table it is rendered inline instead
      -- its '|' separators concealed and its '|---|' row hidden -- so it stays
      navigable, and the box returns once the cursor leaves.
-  3. Conceal does not shrink the width Neovim wraps at, so a text line that
-     would wrap and hide a long run (a URL) is left as raw source instead, which
-     wraps cleanly without a gap.
+  3. Conceal does not shrink the width Neovim wraps at, so hiding a run (a URL)
+     on a line that wraps leaves a gap as wide as the run on that row. Links are
+     still shortened on wrapped lines; only a run wide enough to blank a whole
+     wrapped row (a URL longer than the window) leaves the line as raw source.
   4. Entering an editing mode clears the view and turns conceal off, so the raw
      source reappears; leaving it renders again. This is driven by
      |ModeChanged|.
