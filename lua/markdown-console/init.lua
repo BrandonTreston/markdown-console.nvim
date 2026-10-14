@@ -150,7 +150,8 @@ local TS_LANG = {
 }
 
 -- Returns { [line_index] = { {start, end, group}, ... } } for the block, or nil
--- when there is no parser / query for the language. Ranges are 0-based bytes.
+-- when there is no parser / query for the language. Ranges are 0-based bytes,
+-- line_index is 1-based (matching the block's own line list).
 -- Errors are swallowed: a missing parser must never stop the block rendering.
 local function code_marks(body, lang)
   local ts_lang = TS_LANG[lang:lower()]
@@ -168,8 +169,8 @@ local function code_marks(body, lang)
         for _, node in ipairs(nodes) do
           local sr, sc, er, ec = node:range()
           if sr == er then
-            out[sr] = out[sr] or {}
-            out[sr][#out[sr] + 1] = { sc, ec, '@' .. cap }
+            out[sr + 1] = out[sr + 1] or {}
+            out[sr + 1][#out[sr + 1] + 1] = { sc, ec, '@' .. cap }
           end
         end
       end
