@@ -98,10 +98,14 @@ config can override any of them.
      rendered line and it wraps with 'wrap' like any other line.
   2. Blocks whose rendered shape differs from the source (code boxes, tables,
      mermaid diagrams) get an extmark that fully conceals the block and draws
-     the rendered form as an overlay (|virt_text_pos| = "overlay").
+     the rendered form as an overlay (|virt_text_pos| = "overlay"). A table row
+     too wide for the window is split across several display rows: the first is
+     drawn as the overlay and the rest as |virt_lines| below it.
   3. Conceal does not shrink the width Neovim wraps at, so a text line that
      would wrap and hide a long run (a URL) is left as raw source instead, which
-     wraps cleanly without a gap.
+     wraps cleanly without a gap. The same limitation makes a wide table's
+     wrapped rows leave blank rows behind; keep table source rows short (don't
+     pad them) to minimise this.
   4. Entering an editing mode clears the view and turns conceal off, so the raw
      source reappears; leaving it renders again. This is driven by
      |ModeChanged|.

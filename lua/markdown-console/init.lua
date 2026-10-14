@@ -293,11 +293,72 @@ local function pad(text, cells)
   return text .. string.rep(' ', math.max(0, cells - tw(text)))
 end
 
+-- Word-wrap plain text to `width` display cells, hard-breaking any word longer
+-- than the width. Used to wrap table cells that do not fit the window.
+local function wrap_text(text, width)
+  if width < 1 then width = 1 end
+  local out, cur = {}, ''
+  for word in text:gmatch('%S+') do
+    while #word > width do
+      if #cur > 0 then out[#out + 1] = cur; cur = '' end
+      out[#out + 1] = word:sub(1, width)
+      word = word:sub(width + 1)
+    end
+    if #cur == 0 then
+      cur = word
+    elseif #cur + 1 + #word <= width then
+      cur = cur .. ' ' .. word
+    else
+      out[#out + 1] = cur
+      cur = word
+    end
+  end
+  if #cur > 0 or #out == 0 then out[#out + 1] = cur end
+  return out
+end
+
+-- Split `budget` display cells across `ncol` columns whose natural widths are
+-- `natural`. Every column keeps up to `minw` cells; whatever is left is shared
+-- in proportion to how much each column still needs. The result never exceeds
+-- `budget`, so a wrapped table can never overflow the window.
+local function alloc_widths(natural, budget, ncol)
+  local out = {}
+  if ncol <= 0 then return out end
+  if budget < 1 then budget = 1 end
+  local minw = math.min(8, math.max(1, math.floor(budget / ncol)))
+  local base, need, base_sum = {}, 0, 0
+  for c = 1, ncol do
+    base[c] = math.min(natural[c] or 0, minw)
+    need = need + math.max(0, (natural[c] or 0) - base[c])
+    base_sum = base_sum + base[c]
+  end
+  local left = budget - base_sum
+  if need <= 0 or left <= 0 then
+    local even = math.max(1, math.floor(budget / ncol))
+    for c = 1, ncol do out[c] = even end
+    return out
+  end
+  local acc = 0
+  for c = 1, ncol do
+    local extra = math.floor(left * math.max(0, (natural[c] or 0) - base[c]) / need)
+    acc = acc + extra
+    out[c] = base[c] + extra
+  end
+  local rem = budget - (base_sum + acc)
+  if rem > 0 then
+    local widest = 1
+    for c = 1, ncol do if (natural[c] or 0) > (natural[widest] or 0) then widest = c end end
+    out[widest] = out[widest] + rem
+  end
+  return out
+end
+
 -- Build one row (list of {text, hl} chunks) for each source line, so the rows
 -- line up 1:1 with the buffer and can be overlaid directly. Each row may carry:
 --   fill  - highlight group used for the padding that hides the raw text
 --   min   - minimum display width (full-width level-1 heading bar)
-local function build_rows(lines, bar)
+--   wrap  - extra chunk-lists that continue the row onto further display rows
+local function build_rows(lines, bar, avail)
   local rows = {}
 
   local function put(chunks, fill, min)
@@ -381,20 +442,47 @@ local function build_rows(lines, bar)
     elseif b.kind == 'table' then
       local ncol = 0
       for _, r in ipairs(b.rows) do ncol = math.max(ncol, #r) end
-      local widths = {}
+      -- Natural (unwrapped) width of each column.
+      local natural = {}
       for c = 1, ncol do
         for _, r in ipairs(b.rows) do
-          local cell = r[c] or ''
-          widths[c] = math.max(widths[c] or 0, tw(seg_text(inline(cell))))
+          natural[c] = math.max(natural[c] or 0, tw(seg_text(inline(r[c] or ''))))
         end
       end
+      -- A display row is ' ' + cells joined by ' │ ' + ' ', so it costs the
+      -- cell widths plus those separators and the two edge spaces. When the
+      -- table is wider than the window the columns are shrunk to fit and every
+      -- cell is word-wrapped; a tall row then spans several display rows.
+      local colw, sum = {}, 0
+      for c = 1, ncol do colw[c] = natural[c]; sum = sum + natural[c] end
+      local sepw = 3 * math.max(0, ncol - 1)
+      local budget = (avail or 120) - sepw - 2
+      if sum > budget then
+        colw = alloc_widths(natural, budget, ncol)
+      end
+      local disp_sum = 0
+      for c = 1, ncol do disp_sum = disp_sum + colw[c] end
+      local sep_line = string.rep('─', 2 + sepw + disp_sum)
       for ri, r in ipairs(b.rows) do
-        local cells = {}
-        for c = 1, ncol do cells[c] = pad(seg_text(inline(r[c] or '')), widths[c]) end
-        local line = ' ' .. table.concat(cells, ' │ ') .. ' '
-        put({ { line, ri == 1 and 'MarkdownConsoleTableHeader' or 'MarkdownConsoleTableRow' } })
+        local celllines, height = {}, 1
+        for c = 1, ncol do
+          celllines[c] = wrap_text(seg_text(inline(r[c] or '')), colw[c])
+          height = math.max(height, #celllines[c])
+        end
+        local group = ri == 1 and 'MarkdownConsoleTableHeader' or 'MarkdownConsoleTableRow'
+        for k = 1, height do
+          local parts = {}
+          for c = 1, ncol do parts[c] = pad(celllines[c][k] or '', colw[c]) end
+          local line = ' ' .. table.concat(parts, ' │ ') .. ' '
+          if k == 1 then
+            put({ { line, group } })
+          else
+            rows[#rows].wrap = rows[#rows].wrap or {}
+            rows[#rows].wrap[#rows[#rows].wrap + 1] = { { line, group } }
+          end
+        end
         if ri == 1 then
-          put({ { string.rep('─', tw(line)), 'MarkdownConsoleTableSep' } })
+          put({ { sep_line, 'MarkdownConsoleTableSep' } })
         end
       end
     end
@@ -564,8 +652,10 @@ local function render(buf, force)
       vim.bo[buf].syntax = ''
     end
     local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-    local bar = text_width(vim.fn.bufwinid(buf)) - 2
-    local rows = build_rows(lines, bar)
+    local win = vim.fn.bufwinid(buf)
+    local bar = text_width(win) - 2
+    local avail = text_width(win) - 1
+    local rows = build_rows(lines, bar, avail)
     clear(buf)
     -- Text lines keep the conceal path so they wrap normally with 'wrap' on:
     -- conceal hides the markup and the real text flows across the wrapped rows.
@@ -576,7 +666,6 @@ local function render(buf, force)
     -- and hides a long run (a URL) is left as raw source, which wraps cleanly.
     -- Blocks whose rendered shape differs from the source (code, tables,
     -- mermaid) still use the whole-line overlay.
-    local avail = text_width(vim.fn.bufwinid(buf)) - 1
     local function fits(line)
       return tw(line) <= avail
     end
@@ -613,7 +702,14 @@ local function render(buf, force)
         for _ = 1, b.n do
           li = li + 1
           if li > #lines then break end
-          overlay_row(buf, li - 1, lines[li], rows[li])
+          local rd = rows[li]
+          overlay_row(buf, li - 1, lines[li], rd)
+          -- A table row too wide for the window wraps onto extra display rows,
+          -- which have no source line of their own: draw them as virtual lines
+          -- below the row they belong to.
+          if rd and rd.wrap and #rd.wrap > 0 then
+            pcall(vim.api.nvim_buf_set_extmark, buf, ns, li - 1, 0, { virt_lines = rd.wrap })
+          end
         end
       elseif b.kind == 'heading' then
         li = li + 1

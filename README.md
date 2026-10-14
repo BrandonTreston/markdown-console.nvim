@@ -74,6 +74,11 @@ also shows the raw source. `:MarkdownConsoleToggle` flips the view manually.
 - Mermaid support covers `graph` / `flowchart` diagrams (TD/TB/BT/LR/RL). It is a
   best-effort layout: unrecognised directives are ignored and an unrenderable
   diagram is left as raw source.
+- A table wider than the window is re-flowed: columns are shrunk to fit and cell
+  text wraps inside them, so no cell is cut off. Because Neovim lays out a
+  concealed line at its full *source* width, a table row whose source line is
+  several window-widths long leaves blank rows between its wrapped display rows;
+  keep table source rows short (don't pad them) to minimise this.
 
 ## How It Works
 
@@ -83,10 +88,13 @@ also shows the raw source. `:MarkdownConsoleToggle` flips the view manually.
    wraps with `wrap` like any other line.
 2. Blocks whose rendered shape differs from the source (code boxes, tables,
    mermaid diagrams) get an extmark that fully conceals the block and draws the
-   rendered form as an overlay (`virt_text_pos = "overlay"`).
+   rendered form as an overlay (`virt_text_pos = "overlay"`). A table row too
+   wide for the window is split across several display rows: the first is drawn
+   as the overlay and the rest as `virt_lines` below it.
 3. Conceal does not shrink the width Neovim wraps at, so a text line that would
    wrap *and* hide a long run (a URL) is left as raw source instead, which wraps
-   cleanly without a gap.
+   cleanly without a gap. The same limitation makes a wide table's wrapped rows
+   leave blank rows behind (see Notes).
 4. Entering an editing mode clears the view and turns conceal off, so the raw
    source reappears; leaving it renders again. This is driven entirely by
    `ModeChanged`, so every editing entry point is covered.
