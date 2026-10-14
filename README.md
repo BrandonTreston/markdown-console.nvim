@@ -74,11 +74,15 @@ also shows the raw source. `:MarkdownConsoleToggle` flips the view manually.
 - Mermaid support covers `graph` / `flowchart` diagrams (TD/TB/BT/LR/RL). It is a
   best-effort layout: unrecognised directives are ignored and an unrenderable
   diagram is left as raw source.
-- A table wider than the window is re-flowed: columns are shrunk to fit and cell
-  text wraps inside them, so no cell is cut off. Because Neovim lays out a
-  concealed line at its full *source* width, a table row whose source line is
-  several window-widths long leaves blank rows between its wrapped display rows;
-  keep table source rows short (don't pad them) to minimise this.
+- Tables are drawn as a box (`┌┬┐ ├┼┤ └┴┘`). A table that fits the window keeps
+  its natural column widths; a wider one is re-flowed: the columns are shrunk to
+  fit (never breaking a word if it can be helped) and each cell wraps, so the
+  whole table stays readable. The source rows are collapsed with `conceal_lines`
+  and the re-flowed table is drawn as virtual lines, so there are no blank gaps
+  and nothing is clipped. While the cursor is inside a wide table it is drawn
+  inline instead — its `|` separators concealed and its `|---|` row hidden — so
+  `h`/`j`/`k`/`l` move through the table like ordinary text; the box returns once
+  the cursor leaves.
 
 ## How It Works
 
@@ -88,13 +92,14 @@ also shows the raw source. `:MarkdownConsoleToggle` flips the view manually.
    wraps with `wrap` like any other line.
 2. Blocks whose rendered shape differs from the source (code boxes, tables,
    mermaid diagrams) get an extmark that fully conceals the block and draws the
-   rendered form as an overlay (`virt_text_pos = "overlay"`). A table row too
-   wide for the window is split across several display rows: the first is drawn
-   as the overlay and the rest as `virt_lines` below it.
+   rendered form as an overlay (`virt_text_pos = "overlay"`). A table too wide
+   for the window instead collapses its source rows with `conceal_lines` and is
+   drawn as `virt_lines` on the neighbouring row; while the cursor is on such a
+   table it is rendered inline instead (see `render_table_inline`) so it stays
+   navigable.
 3. Conceal does not shrink the width Neovim wraps at, so a text line that would
    wrap *and* hide a long run (a URL) is left as raw source instead, which wraps
-   cleanly without a gap. The same limitation makes a wide table's wrapped rows
-   leave blank rows behind (see Notes).
+   cleanly without a gap.
 4. Entering an editing mode clears the view and turns conceal off, so the raw
    source reappears; leaving it renders again. This is driven entirely by
    `ModeChanged`, so every editing entry point is covered.
@@ -108,7 +113,8 @@ also shows the raw source. `:MarkdownConsoleToggle` flips the view manually.
 
 ## Requirements
 
-- Neovim 0.9+
+- Neovim 0.11+ (wide tables need `conceal_lines`; on older versions they fall
+  back to raw source)
 - A 24-bit colour terminal for the default colours
 
 ## License

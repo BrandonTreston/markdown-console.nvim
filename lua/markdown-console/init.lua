@@ -37,6 +37,12 @@ local ns = vim.api.nvim_create_namespace('markdown_console')
 local rendered = {}
 -- bufnr -> the buffer's 'syntax' name, saved while the overlay is shown
 local saved_syntax = {}
+-- bufnr -> list of {first, last} 0-based row ranges of tables drawn as wide
+-- blocks (their source rows are concealed, so the cursor cannot sit on them).
+local wide_ranges = {}
+-- bufnr -> {first, last} of the wide table currently rendered inline so the
+-- cursor can move through it, or nil.
+local revealed = {}
 -- reentrancy guard
 local busy = false
 
@@ -259,7 +265,7 @@ local function parse(lines)
     elseif line:match('^%s*%d+%.%s+') then
       blocks[#blocks + 1] = { kind = 'list', marker = line:match('^%s*(%d+)'), segs = inline((line:gsub('^%s*%d+%.%s+', ''))), n = 1 }
     elseif line:match('^|.*|%s*$') then
-      local rows = {}
+      local rows, start = {}, i
       while i <= #lines and lines[i]:match('^|.*|%s*$') do
         local body = vim.trim(lines[i]):gsub('^|', ''):gsub('|$', '')
         local cells, is_sep = {}, true
@@ -272,7 +278,7 @@ local function parse(lines)
         next_()
       end
       i = i - 1
-      blocks[#blocks + 1] = { kind = 'table', rows = rows, n = #rows + 1 }
+      blocks[#blocks + 1] = { kind = 'table', rows = rows, n = i - start + 1 }
     else
       blocks[#blocks + 1] = { kind = 'paragraph', segs = inline(line), n = 1 }
     end
@@ -293,8 +299,8 @@ local function pad(text, cells)
   return text .. string.rep(' ', math.max(0, cells - tw(text)))
 end
 
--- Word-wrap plain text to `width` display cells, hard-breaking any word longer
--- than the width. Used to wrap table cells that do not fit the window.
+-- Word-wrap plain text to `width` cells, hard-breaking any word longer than the
+-- width. Used to wrap table cells in the block render.
 local function wrap_text(text, width)
   if width < 1 then width = 1 end
   local out, cur = {}, ''
@@ -317,48 +323,93 @@ local function wrap_text(text, width)
   return out
 end
 
--- Split `budget` display cells across `ncol` columns whose natural widths are
--- `natural`. Every column keeps up to `minw` cells; whatever is left is shared
--- in proportion to how much each column still needs. The result never exceeds
--- `budget`, so a wrapped table can never overflow the window.
-local function alloc_widths(natural, budget, ncol)
+-- Split `budget` cells across `ncol` columns. Each column first gets its longest
+-- word (and its header cell, capped by its natural width) so neither is broken
+-- mid-way, filled smallest-demand-first (max-min fair) so one very long word
+-- cannot starve the others. Left-over budget then grows columns towards their
+-- natural width in proportion to what they still need. Never exceeds `budget`.
+local function alloc_widths(natural, wordmin, budget, ncol)
   local out = {}
   if ncol <= 0 then return out end
   if budget < 1 then budget = 1 end
-  local minw = math.min(8, math.max(1, math.floor(budget / ncol)))
-  local base, need, base_sum = {}, 0, 0
+  local want = {}
   for c = 1, ncol do
-    base[c] = math.min(natural[c] or 0, minw)
-    need = need + math.max(0, (natural[c] or 0) - base[c])
-    base_sum = base_sum + base[c]
+    want[c] = math.min(natural[c] or 0, math.max(1, wordmin[c] or 1))
   end
-  local left = budget - base_sum
-  if need <= 0 or left <= 0 then
-    local even = math.max(1, math.floor(budget / ncol))
-    for c = 1, ncol do out[c] = even end
-    return out
+  -- Give every column its longest word where the budget allows, satisfying the
+  -- smallest demands first; the rest split what remains in proportion to need.
+  local rem, nrem = budget, ncol
+  local pending = {}
+  for c = 1, ncol do pending[c] = true end
+  while nrem > 0 do
+    local share = math.floor(rem / nrem)
+    local progressed = false
+    for c = 1, ncol do
+      if pending[c] and want[c] <= share then
+        out[c] = want[c]
+        rem = rem - want[c]
+        pending[c] = false
+        nrem = nrem - 1
+        progressed = true
+      end
+    end
+    if not progressed then break end
   end
-  local acc = 0
-  for c = 1, ncol do
-    local extra = math.floor(left * math.max(0, (natural[c] or 0) - base[c]) / need)
-    acc = acc + extra
-    out[c] = base[c] + extra
+  if nrem > 0 then
+    local wsum = 0
+    for c = 1, ncol do if pending[c] then wsum = wsum + want[c] end end
+    for c = 1, ncol do
+      if pending[c] then out[c] = math.max(1, math.floor(rem * want[c] / wsum)) end
+    end
   end
-  local rem = budget - (base_sum + acc)
-  if rem > 0 then
+  -- Spend whatever is left growing columns towards their natural width, in
+  -- proportion to how much each column still needs, then hand out the rounding
+  -- crumbs one cell at a time so a column that just misses a word still gets it.
+  local sum = 0
+  for c = 1, ncol do sum = sum + (out[c] or 0) end
+  local left = budget - sum
+  if left > 0 then
+    local need = 0
+    for c = 1, ncol do need = need + math.max(0, (natural[c] or 0) - (out[c] or 0)) end
+    if need > 0 then
+      local acc = 0
+      for c = 1, ncol do
+        local extra = math.floor(left * math.max(0, (natural[c] or 0) - (out[c] or 0)) / need)
+        out[c] = (out[c] or 0) + extra
+        acc = acc + extra
+      end
+      local crumbs = left - acc
+      while crumbs > 0 do
+        local best, bestgap
+        for c = 1, ncol do
+          local gap = math.max(0, (natural[c] or 0) - (out[c] or 0))
+          if gap > 0 and (not bestgap or gap < bestgap) then best, bestgap = c, gap end
+        end
+        if not best then break end
+        out[best] = out[best] + 1
+        crumbs = crumbs - 1
+      end
+    end
+  end
+  -- Guarantee the total never exceeds the budget.
+  sum = 0
+  for c = 1, ncol do sum = sum + out[c] end
+  while sum > budget do
     local widest = 1
-    for c = 1, ncol do if (natural[c] or 0) > (natural[widest] or 0) then widest = c end end
-    out[widest] = out[widest] + rem
+    for c = 1, ncol do if out[c] > out[widest] then widest = c end end
+    if out[widest] <= 1 then break end
+    out[widest] = out[widest] - 1
+    sum = sum - 1
   end
   return out
 end
 
 -- Build one row (list of {text, hl} chunks) for each source line, so the rows
--- line up 1:1 with the buffer and can be overlaid directly. Each row may carry:
+-- line up 1:1 with the buffer. Each row may carry:
 --   fill  - highlight group used for the padding that hides the raw text
 --   min   - minimum display width (full-width level-1 heading bar)
---   wrap  - extra chunk-lists that continue the row onto further display rows
-local function build_rows(lines, bar, avail)
+-- Tables and mermaid diagrams are drawn separately (they need the buffer rows).
+local function build_rows(lines, bar)
   local rows = {}
 
   local function put(chunks, fill, min)
@@ -440,51 +491,9 @@ local function build_rows(lines, bar, avail)
       put({ { '└' .. string.rep('─', inner) .. '┘', Fence } })
 
     elseif b.kind == 'table' then
-      local ncol = 0
-      for _, r in ipairs(b.rows) do ncol = math.max(ncol, #r) end
-      -- Natural (unwrapped) width of each column.
-      local natural = {}
-      for c = 1, ncol do
-        for _, r in ipairs(b.rows) do
-          natural[c] = math.max(natural[c] or 0, tw(seg_text(inline(r[c] or ''))))
-        end
-      end
-      -- A display row is ' ' + cells joined by ' │ ' + ' ', so it costs the
-      -- cell widths plus those separators and the two edge spaces. When the
-      -- table is wider than the window the columns are shrunk to fit and every
-      -- cell is word-wrapped; a tall row then spans several display rows.
-      local colw, sum = {}, 0
-      for c = 1, ncol do colw[c] = natural[c]; sum = sum + natural[c] end
-      local sepw = 3 * math.max(0, ncol - 1)
-      local budget = (avail or 120) - sepw - 2
-      if sum > budget then
-        colw = alloc_widths(natural, budget, ncol)
-      end
-      local disp_sum = 0
-      for c = 1, ncol do disp_sum = disp_sum + colw[c] end
-      local sep_line = string.rep('─', 2 + sepw + disp_sum)
-      for ri, r in ipairs(b.rows) do
-        local celllines, height = {}, 1
-        for c = 1, ncol do
-          celllines[c] = wrap_text(seg_text(inline(r[c] or '')), colw[c])
-          height = math.max(height, #celllines[c])
-        end
-        local group = ri == 1 and 'MarkdownConsoleTableHeader' or 'MarkdownConsoleTableRow'
-        for k = 1, height do
-          local parts = {}
-          for c = 1, ncol do parts[c] = pad(celllines[c][k] or '', colw[c]) end
-          local line = ' ' .. table.concat(parts, ' │ ') .. ' '
-          if k == 1 then
-            put({ { line, group } })
-          else
-            rows[#rows].wrap = rows[#rows].wrap or {}
-            rows[#rows].wrap[#rows[#rows].wrap + 1] = { { line, group } }
-          end
-        end
-        if ri == 1 then
-          put({ { sep_line, 'MarkdownConsoleTableSep' } })
-        end
-      end
+      -- Drawn by render_table, which may collapse the source rows into a block.
+      -- Emit placeholders so later source lines keep their row index.
+      for _ = 1, b.n do put({}) end
     end
   end
 
@@ -633,6 +642,153 @@ local function overlay_text(buf, row, line_len, text, group)
   })
 end
 
+-- Render a wide table inline, keeping every source row a real buffer line so the
+-- cursor can move through the table with h/j/k/l (mapping directly onto the raw
+-- source underneath). The `|` separators are concealed and the `|---|` delimiter
+-- row is collapsed, so the rows read as rendered cells rather than raw markdown.
+local function render_table_inline(buf, first, last, lines)
+  local HDR = 'MarkdownConsoleTableHeader'
+  local data_group = 'MarkdownConsoleTableRow'
+  for r = first, last do
+    local line = lines[r + 1] or ''
+    local body = vim.trim(line):gsub('^|', ''):gsub('|$', '')
+    local n, is_sep = 0, true
+    for cell in (body .. '|'):gmatch('([^|]*)|') do
+      n = n + 1
+      if not vim.trim(cell):match('^:?-+:?$') then is_sep = false end
+    end
+    if is_sep and n > 0 then
+      -- Drop the `|---|` row entirely (it has no content of its own).
+      pcall(vim.api.nvim_buf_set_extmark, buf, ns, r, 0, { end_row = r, conceal_lines = '' })
+    else
+      local c = 1
+      while true do
+        local s, e = line:find('|', c, true)
+        if not s then break end
+        conceal(buf, r, s - 1, e)
+        c = e + 1
+      end
+      inline_row(buf, r, line, 0, r == first and HDR or data_group)
+    end
+  end
+end
+
+-- Render a table block. `first` is the 0-based row of the table's first source
+-- line. When the table fits the window each source row is overlaid 1:1 (the
+-- cursor can move over the rendered rows). When it does not fit, the source rows
+-- are collapsed with `conceal_lines` and the whole re-flowed table is drawn as
+-- `virt_lines` on the neighbouring row, so nothing is clipped and no blank rows
+-- are left behind. `conceal_lines` needs Neovim 0.11+; older versions keep the
+-- raw source for wide tables.
+local can_conceal_lines = vim.fn.has('nvim-0.11') == 1
+local function render_table(buf, blk, first, lines, avail)
+  local ncol = 0
+  for _, r in ipairs(blk.rows) do ncol = math.max(ncol, #r) end
+  if ncol == 0 then return end
+  local natural, wordmin = {}, {}
+  for c = 1, ncol do
+    natural[c], wordmin[c] = 0, 1
+    for _, r in ipairs(blk.rows) do
+      local t = seg_text(inline(r[c] or ''))
+      natural[c] = math.max(natural[c], tw(t))
+      for w in t:gmatch('%S+') do wordmin[c] = math.max(wordmin[c], tw(w)) end
+    end
+  end
+  -- Keep the header cell on one line where the column can fit it.
+  for c = 1, ncol do
+    local hw = tw(seg_text(inline((blk.rows[1] or {})[c] or '')))
+    if hw > wordmin[c] then wordmin[c] = hw end
+  end
+  local HDR, ROW, SEP = 'MarkdownConsoleTableHeader', 'MarkdownConsoleTableRow', 'MarkdownConsoleTableSep'
+  -- A boxed table: `cw[c]` is the content width of column c. Each cell is drawn
+  -- with a space on either side, so a rule segment under it is `cw[c] + 2` wide
+  -- and the whole box costs `3*ncol + 1` cells of framing.
+  local overhead = 3 * ncol + 1
+  local function mkrow(cw, cells, group)
+    local parts = {}
+    for c = 1, ncol do parts[c] = ' ' .. pad(cells[c] or '', cw[c]) .. ' ' end
+    return { { '│' .. table.concat(parts, '│') .. '│', group } }
+  end
+  local function mkrule(l, m, r, cw)
+    local parts = {}
+    for c = 1, ncol do parts[c] = string.rep('─', cw[c] + 2) end
+    return { { l .. table.concat(parts, m) .. r, SEP } }
+  end
+
+  local total = overhead
+  for c = 1, ncol do total = total + natural[c] end
+
+  if total <= avail then
+    -- Fits: overlay one source row at a time (the cursor can move over the
+    -- rendered rows). `blk.rows` omits the |---| line, so the header is on the
+    -- first row, the rule on the second, data after that. The top and bottom of
+    -- the box are drawn as virtual lines on the first and last source rows.
+    for ri, r in ipairs(blk.rows) do
+      local cells = {}
+      for c = 1, ncol do cells[c] = seg_text(inline(r[c] or '')) end
+      local src = ri == 1 and first or first + ri
+      overlay_row(buf, src, lines[src + 1], { chunks = mkrow(natural, cells, ri == 1 and HDR or ROW) })
+    end
+    overlay_row(buf, first + 1, lines[first + 2], { chunks = mkrule('├', '┼', '┤', natural) })
+    local last = first + blk.n - 1
+    pcall(vim.api.nvim_buf_set_extmark, buf, ns, first, 0, {
+      virt_lines_above = true, virt_lines = { mkrule('┌', '┬', '┐', natural) }, priority = 90,
+    })
+    pcall(vim.api.nvim_buf_set_extmark, buf, ns, last, 0, {
+      virt_lines = { mkrule('└', '┴', '┘', natural) }, priority = 90,
+    })
+    return
+  end
+
+  -- Does not fit: re-flow into a block. Shrink columns to the window and
+  -- word-wrap each cell, giving each row as many display rows as it needs.
+  if not can_conceal_lines then return end
+
+  -- Anchor the block on a neighbouring line (the block itself has no row of its
+  -- own once its source lines are concealed).
+  local last = first + blk.n - 1
+  local anchor, above
+  if last + 1 <= #lines - 1 then
+    anchor, above = last + 1, true
+  elseif first - 1 >= 0 then
+    anchor, above = first - 1, false
+  else
+    return -- the table is the whole buffer; nothing to anchor to, leave raw
+  end
+  wide_ranges[buf] = wide_ranges[buf] or {}
+  wide_ranges[buf][#wide_ranges[buf] + 1] = { first, last }
+  -- The cursor cannot sit on concealed rows, so while it is inside this table we
+  -- render it inline instead: the rows stay real, so h/j/k/l move through them.
+  local rev = revealed[buf]
+  if rev and rev[1] == first and rev[2] == last then
+    render_table_inline(buf, first, last, lines)
+    return
+  end
+
+  local cw = alloc_widths(natural, wordmin, avail - overhead, ncol)
+  local display = { mkrule('┌', '┬', '┐', cw) }
+  for ri, r in ipairs(blk.rows) do
+    local celllines, height = {}, 1
+    for c = 1, ncol do
+      celllines[c] = wrap_text(seg_text(inline(r[c] or '')), cw[c])
+      height = math.max(height, #celllines[c])
+    end
+    local group = ri == 1 and HDR or ROW
+    for k = 1, height do
+      local cells = {}
+      for c = 1, ncol do cells[c] = celllines[c][k] or '' end
+      display[#display + 1] = mkrow(cw, cells, group)
+    end
+    if ri == 1 then display[#display + 1] = mkrule('├', '┼', '┤', cw) end
+  end
+  display[#display + 1] = mkrule('└', '┴', '┘', cw)
+
+  pcall(vim.api.nvim_buf_set_extmark, buf, ns, first, 0, { end_row = last, conceal_lines = '' })
+  pcall(vim.api.nvim_buf_set_extmark, buf, ns, anchor, 0, {
+    virt_lines_above = above, virt_lines = display, priority = 90,
+  })
+end
+
 local function render(buf, force)
   if busy or not md(buf) or not shown(buf) then return end
   if rendered[buf] and not force then
@@ -655,8 +811,9 @@ local function render(buf, force)
     local win = vim.fn.bufwinid(buf)
     local bar = text_width(win) - 2
     local avail = text_width(win) - 1
-    local rows = build_rows(lines, bar, avail)
+    local rows = build_rows(lines, bar)
     clear(buf)
+    wide_ranges[buf] = {}
     -- Text lines keep the conceal path so they wrap normally with 'wrap' on:
     -- conceal hides the markup and the real text flows across the wrapped rows.
     -- Conceal does not shrink the width Neovim wraps at (the hidden cells still
@@ -698,32 +855,30 @@ local function render(buf, force)
         else
           li = li + b.n
         end
-      elseif b.kind == 'code' or b.kind == 'table' then
+      elseif b.kind == 'code' then
         for _ = 1, b.n do
           li = li + 1
           if li > #lines then break end
-          local rd = rows[li]
-          overlay_row(buf, li - 1, lines[li], rd)
-          -- A table row too wide for the window wraps onto extra display rows,
-          -- which have no source line of their own: draw them as virtual lines
-          -- below the row they belong to.
-          if rd and rd.wrap and #rd.wrap > 0 then
-            pcall(vim.api.nvim_buf_set_extmark, buf, ns, li - 1, 0, { virt_lines = rd.wrap })
-          end
+          overlay_row(buf, li - 1, lines[li], rows[li])
         end
+      elseif b.kind == 'table' then
+        render_table(buf, b, li, lines, avail)
+        li = li + b.n
       elseif b.kind == 'heading' then
         li = li + 1
-        local line = lines[li]
+        local line = lines[li] or ''
         local hashes = line:match('^(#+)%s')
-        local prefix = #hashes + 1
-        local group = 'MarkdownConsoleH' .. b.level
-        local pgroup = b.level == 1 and 'MarkdownConsoleH1Prefix' or 'MarkdownConsoleHPrefix'
-        pcall(vim.api.nvim_buf_set_extmark, buf, ns, li - 1, 0, {
-          end_col = #line, hl_group = group, hl_eol = b.level == 1,
-        })
-        if text_ok(line, line:sub(prefix + 1)) then
-          paint(buf, li - 1, 0, prefix, pgroup)
-          if #line > prefix then inline_row(buf, li - 1, line:sub(prefix + 1), prefix, group) end
+        if hashes then
+          local prefix = #hashes + 1
+          local group = 'MarkdownConsoleH' .. b.level
+          local pgroup = b.level == 1 and 'MarkdownConsoleH1Prefix' or 'MarkdownConsoleHPrefix'
+          pcall(vim.api.nvim_buf_set_extmark, buf, ns, li - 1, 0, {
+            end_col = #line, hl_group = group, hl_eol = b.level == 1,
+          })
+          if text_ok(line, line:sub(prefix + 1)) then
+            paint(buf, li - 1, 0, prefix, pgroup)
+            if #line > prefix then inline_row(buf, li - 1, line:sub(prefix + 1), prefix, group) end
+          end
         end
       elseif b.kind == 'paragraph' then
         li = li + 1
@@ -776,7 +931,34 @@ local function restore(buf)
     saved_syntax[buf] = nil
   end
   rendered[buf] = nil
+  revealed[buf] = nil
   busy = false
+end
+
+-- A wide table collapses its source rows into a virtual block, but then the
+-- cursor has no real row to sit on. While the cursor is inside such a table we
+-- render it inline instead (see render_table_inline) so h/j/k/l move through it,
+-- and restore the block as soon as the cursor leaves. Cheap when nothing changed:
+-- it only re-renders on the transitions in and out of a table.
+local function sync_reveal(buf)
+  if busy or not md(buf) or not rendered[buf] then return end
+  if is_raw_mode(vim.fn.mode(1)) then return end
+  if vim.api.nvim_get_current_buf() ~= buf then return end
+  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
+  local hit
+  for _, r in ipairs(wide_ranges[buf] or {}) do
+    if row >= r[1] and row <= r[2] then hit = r; break end
+  end
+  local cur = revealed[buf]
+  if hit then
+    if not (cur and cur[1] == hit[1] and cur[2] == hit[2]) then
+      revealed[buf] = hit
+      render(buf, true)
+    end
+  elseif cur then
+    revealed[buf] = nil
+    render(buf, true)
+  end
 end
 
 local function toggle()
@@ -853,7 +1035,10 @@ function M.setup()
   vim.api.nvim_create_autocmd({ 'BufWinEnter', 'BufEnter' }, {
     pattern = MD_PATTERN,
     callback = function(args)
-      if vim.fn.mode() == 'n' then render(args.buf) end
+      if vim.fn.mode() == 'n' then
+        render(args.buf)
+        sync_reveal(args.buf)
+      end
     end,
   })
 
@@ -873,7 +1058,16 @@ function M.setup()
         restore(args.buf)
       elseif is_raw_mode(old_mode) then
         render(args.buf)
+        sync_reveal(args.buf)
       end
+    end,
+  })
+
+  -- Render a wide table inline while the cursor is inside it (see sync_reveal),
+  -- and draw the boxed block again once the cursor moves away.
+  vim.api.nvim_create_autocmd('CursorMoved', {
+    callback = function(args)
+      sync_reveal(args.buf)
     end,
   })
 
@@ -885,6 +1079,7 @@ function M.setup()
       vim.schedule(function()
         if vim.api.nvim_buf_is_valid(args.buf) and not is_raw_mode(vim.fn.mode(1)) then
           render(args.buf, true)
+          sync_reveal(args.buf)
         end
       end)
     end,
@@ -894,7 +1089,10 @@ function M.setup()
   vim.api.nvim_create_autocmd({ 'VimResized', 'WinResized' }, {
     callback = function()
       for buf in pairs(rendered) do
-        if vim.api.nvim_buf_is_valid(buf) then render(buf, true) end
+        if vim.api.nvim_buf_is_valid(buf) then
+          render(buf, true)
+          sync_reveal(buf)
+        end
       end
     end,
   })
@@ -902,6 +1100,8 @@ function M.setup()
   vim.api.nvim_create_autocmd({ 'BufWipeout', 'BufDelete' }, {
     callback = function(args)
       rendered[args.buf] = nil
+      wide_ranges[args.buf] = nil
+      revealed[args.buf] = nil
     end,
   })
 
