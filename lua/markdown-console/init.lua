@@ -893,8 +893,15 @@ local function render(buf, force)
         local line = lines[li]
         local m = line:match('^(%s*[%-%*+]%s+)') or line:match('^(%s*%d+%.%s+)') or ''
         if text_ok(line, line:sub(#m + 1)) then
-          local bullet = b.marker == '-' and '  • ' or ('  ' .. b.marker .. '. ')
-          marker(buf, li - 1, #m, bullet, 'MarkdownConsoleList')
+          local lead = line:match('^(%s*)') or ''
+          local depth = math.floor(#lead / 2)
+          local glyph
+          if b.marker == '-' then
+            glyph = ({ '•', '◦', '▪' })[depth % 3 + 1]
+          else
+            glyph = b.marker .. '.'
+          end
+          marker(buf, li - 1, #m, '  ' .. lead .. glyph .. ' ', 'MarkdownConsoleList')
           inline_row(buf, li - 1, line:sub(#m + 1), #m, nil)
         end
       elseif b.kind == 'quote' then

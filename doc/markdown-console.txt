@@ -21,9 +21,10 @@ written to the buffer.
 
   - Normal mode: rendered markdown with highlight groups. Headings (level 1
     has a full-width background bar, level 2 is underlined, levels 3-6 are
-    bold), bullet and numbered lists, fenced code blocks with box-drawing
-    borders and optional treesitter syntax highlighting, blockquotes, boxed
-    tables with aligned columns, horizontal rules, and inline styling.
+    bold), bullet and numbered lists (nested levels keep their indent), fenced
+    code blocks with box-drawing borders and optional treesitter syntax
+    highlighting, blockquotes, boxed tables with aligned columns, horizontal
+    rules, and inline styling.
   - Editing (insert, replace, visual): raw markdown source.
   - Native |undo| and redo work for every edit (normal and insert), because the
     buffer text is never changed.

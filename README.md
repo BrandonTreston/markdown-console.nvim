@@ -9,7 +9,7 @@ Now I need markdown in my terminal because I need to read and curate all the slo
 - **Normal mode**: rendered markdown with highlight groups
   - Headings: level 1 with a full-width background bar, level 2 underlined,
     levels 3-6 bold, each in its own colour
-  - Bullet / numbered lists
+  - Bullet / numbered lists, nested levels keep their indent
   - Code blocks with box-drawing borders, a language label, and optional
     treesitter syntax highlighting (lua, python, js/ts, rust, go, bash, ...)
   - Blockquotes with a `▏` prefix
